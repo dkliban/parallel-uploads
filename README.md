@@ -35,7 +35,7 @@ environment variables).
 ## Usage
 
 ```bash
-upload-files <source_dir> <s3://bucket/prefix> [concurrency]
+./upload-files <source_dir> <s3://bucket/prefix> [concurrency]
 ```
 
 ### Examples
@@ -43,13 +43,13 @@ upload-files <source_dir> <s3://bucket/prefix> [concurrency]
 Upload a directory with default concurrency (10):
 
 ```bash
-upload-files upload s3://my-bucket/workspaces/123/repos/AutoSD
+./upload-files upload s3://my-bucket/workspaces/123/repos/AutoSD
 ```
 
 Upload with 20 concurrent uploads:
 
 ```bash
-upload-files upload s3://my-bucket/workspaces/123/repos/AutoSD 20
+./upload-files upload s3://my-bucket/workspaces/123/repos/AutoSD 20
 ```
 
 ## Notes
