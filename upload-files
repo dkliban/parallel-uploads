@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+import os
+import sys
+import boto3
+from urllib.parse import urlparse
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_WORKERS = 10
+
+def parse_s3_uri(s3_uri):
+    """Parse S3 URI like s3://bucket-name/prefix and return (bucket, prefix)."""
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip("/")  # remove leading slash
+    return bucket, prefix
+
+def upload_file(s3_client, bucket, local_path, s3_path):
+    """Upload one file to S3. Return None on success, error string on failure."""
+    try:
+        s3_client.upload_file(local_path, bucket, s3_path)
+        return None
+    except Exception as e:
+        return f"❌ {local_path} -> s3://{bucket}/{s3_path}: {e}"
+
+def main():
+    if len(sys.argv) != 3:
+        sys.stderr.write("Usage: python upload_to_s3.py <source_dir> <s3://bucket/prefix>\n")
+        sys.exit(1)
+
+    source_dir = sys.argv[1]
+    dest_uri = sys.argv[2]
+
+    if not os.path.isdir(source_dir):
+        sys.stderr.write(f"❌ Source directory does not exist: {source_dir}\n")
+        sys.exit(1)
+
+    bucket, prefix = parse_s3_uri(dest_uri)
+    s3_client = boto3.client("s3")
+
+    # Walk source directory
+    files_to_upload = []
+    for root, _, files in os.walk(source_dir):
+        for f in files:
+            local_path = os.path.join(root, f)
+            rel_path = os.path.relpath(local_path, source_dir)
+            s3_path = str(Path(prefix) / rel_path).replace("\\", "/")  # normalize
+            files_to_upload.append((local_path, s3_path))
+
+    # Upload in parallel
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(upload_file, s3_client, bucket, lp, sp)
+            for lp, sp in files_to_upload
+        ]
+        for future in as_completed(futures):
+            error = future.result()
+            if error:
+                print(error, file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
+
