@@ -40,21 +40,17 @@ def main():
     bucket, prefix = parse_s3_uri(dest_uri)
     s3_client = boto3.client("s3")
 
-    # Walk source directory
-    files_to_upload = []
-    for root, _, files in os.walk(source_dir):
-        for f in files:
-            local_path = os.path.join(root, f)
-            rel_path = os.path.relpath(local_path, source_dir)
-            s3_path = str(Path(prefix) / rel_path).replace("\\", "/")  # normalize
-            files_to_upload.append((local_path, s3_path))
-
     # Upload in parallel
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(upload_file, s3_client, bucket, lp, sp)
-            for lp, sp in files_to_upload
-        ]
+        futures = []
+        # Walk source directory
+        for root, _, files in os.walk(source_dir):
+            for f in files:
+                local_path = os.path.join(root, f)
+                rel_path = os.path.relpath(local_path, source_dir)
+                s3_path = str(Path(prefix) / rel_path).replace("\\", "/")  # normalize
+                futures.append(executor.submit(upload_file, s3_client, bucket, local_path, s3_path))
+
         for future in as_completed(futures):
             error = future.result()
             if error:
