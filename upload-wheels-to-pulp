@@ -129,6 +129,7 @@ def add_packages_to_repository(configuration, repository, packages):
     api_client = pulpcore.client.pulp_python.ApiClient(configuration)
     repo_client = pulpcore.client.pulp_python.RepositoriesPythonApi(api_client)
     response = repo_client.modify(python_python_repository_href=repository.pulp_href, repository_add_remove_content={"add_content_units":packages, "remove_content_units":None})
+    print(f"Repository Version Create Task: {response.task}")
 
 def upload_wheels_to_pulp(source_dir, repository_name, base_path, concurrency):
     """
