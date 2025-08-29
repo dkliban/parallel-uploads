@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import tomllib
+
+import pulpcore.client.pulpcore
+import pulpcore.client.pulp_python
+from pulpcore.client.pulpcore.rest import ApiException as PulpcoreApiException
+from pulpcore.client.pulp_python.rest import ApiException as PythonApiException
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Upload a directory of Python Wheels to a Pulp server."
+    )
+
+    parser.add_argument(
+        "source_directory",
+        type=str,
+        help="Path to the source directory of Python Wheels."
+    )
+
+    parser.add_argument(
+        "repository_name",
+        type=str,
+        help="Name of the repository and distribution in Pulp."
+    )
+
+    parser.add_argument(
+        "base_path",
+        type=str,
+        help="Base path for the distribution in Pulp."
+    )
+
+    parser.add_argument(
+        "concurrency",
+        type=int,
+        help="Number of concurrent uploads."
+    )
+
+    args = parser.parse_args()
+
+    print("Source Directory:", args.source_directory)
+    print("Repository Name:", args.repository_name)
+    print("Base Path:", args.base_path)
+    print("Concurrency:", args.concurrency)
+
+    return args
+
+
+def config_from_pulp_cli_config(path=None):
+    """
+    Create a Pulp client from a standard configuration file that is
+    used by the `pulp` CLI tool
+    """
+    path = os.path.expanduser(path or "~/.config/pulp/cli.toml")
+    with open(path, "rb") as fp:
+        config = tomllib.load(fp)["cli-prod"]
+        configuration = pulpcore.client.pulpcore.Configuration()
+        configuration.host = config["base_url"]
+        #configuration.username = config["username"]
+        #configuration.password = config["password"]
+        configuration.cert_file = config["cert"]
+        configuration.key_file = config["key"]
+
+    return configuration
+
+def wheels(source_dir):
+    """
+    Generator that yields wheel names from a source directory.
+    """
+    for root, _, files in os.walk(source_dir):
+        for filename in files:
+            if filename.endswith(".whl"):
+                yield os.path.join(root, filename)
+
+def get_or_create_repository(configuration, name):
+    """
+    Create a repository if it doesn't exist.
+    """
+    api_client = pulpcore.client.pulp_python.ApiClient(configuration)
+    repo_client = pulpcore.client.pulp_python.RepositoriesPythonApi(api_client)
+    data = pulpcore.client.pulp_python.PythonPythonRepository(name=name)
+    try:
+        repo = repo_client.create(data)
+    except PythonApiException as e:
+        if "name" in e.body and "unique" in e.body:
+            repo_list = repo_client.list(name=name)
+            repo = repo_list.results.pop()
+        else:
+            raise e
+    return repo
+
+def get_or_create_distribution(configuration, name, repository, base_path):
+    """
+    Create a distribution if it doesn't exist.
+    """
+    api_client = pulpcore.client.pulp_python.ApiClient(configuration)
+    distro_client = pulpcore.client.pulp_python.DistributionsPypiApi(api_client)
+    data = pulpcore.client.pulp_python.PythonPythonDistribution(name=name, repository=repository.pulp_href, base_path=base_path)
+    try:
+        distro = distro_client.create(data)
+    except PythonApiException as e:
+        if "name" in e.body and "unique" in e.body:
+            distro_list = distro_client.list(name=name)
+            distro = distro_list.results.pop()
+        else:
+            raise e
+    return distro
+
+def upload_package(configuration, path, labels=None):
+    """
+    Upload a Python Wheel to a Pulp server with the given labels.
+    """
+    api_client = pulpcore.client.pulp_python.ApiClient(configuration)
+    package_client = pulpcore.client.pulp_python.ContentPackagesApi(api_client)
+    try:
+        package = package_client.upload(file=path, pulp_labels=labels)
+    except PythonApiException as e:
+        print(f"Failed to upload {path}.")
+        return None
+    return package.prn
+
+def add_packages_to_repository(configuration, repository, packages):
+    """
+    Creates a new repository version by adding packages to the repository.
+    """
+    api_client = pulpcore.client.pulp_python.ApiClient(configuration)
+    repo_client = pulpcore.client.pulp_python.RepositoriesPythonApi(api_client)
+    response = repo_client.modify(python_python_repository_href=repository.pulp_href, repository_add_remove_content={"add_content_units":packages, "remove_content_units":None})
+
+def upload_wheels_to_pulp(source_dir, repository_name, base_path, concurrency):
+    """
+    Uploads a directory of Python wheels to a Pulp server.
+    """
+    cfg = config_from_pulp_cli_config()
+    repo = get_or_create_repository(cfg, repository_name)
+    get_or_create_distribution(cfg, repository_name, repo, base_path)
+    packages = []
+    for wheel in wheels(source_dir):
+        package_prn = upload_package(cfg, wheel, {})
+        packages.append(package_prn)
+    add_packages_to_repository(cfg, repo, packages)
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    upload_wheels_to_pulp(args.source_directory, args.repository_name, args.base_path, args.concurrency)
