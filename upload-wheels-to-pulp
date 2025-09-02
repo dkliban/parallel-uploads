@@ -63,6 +63,7 @@ def config_from_pulp_cli_config(path=None):
         #configuration.password = config["password"]
         configuration.cert_file = config["cert"]
         configuration.key_file = config["key"]
+        configuration.domain = config["domain"]
 
     return configuration
 
@@ -83,10 +84,10 @@ def get_or_create_repository(configuration, name):
     repo_client = pulpcore.client.pulp_python.RepositoriesPythonApi(api_client)
     data = pulpcore.client.pulp_python.PythonPythonRepository(name=name)
     try:
-        repo = repo_client.create(data)
+        repo = repo_client.create(data, pulp_domain=configuration.domain)
     except PythonApiException as e:
         if "name" in e.body and "unique" in e.body:
-            repo_list = repo_client.list(name=name)
+            repo_list = repo_client.list(name=name, pulp_domain=configuration.domain)
             repo = repo_list.results.pop()
         else:
             raise e
@@ -100,10 +101,10 @@ def get_or_create_distribution(configuration, name, repository, base_path):
     distro_client = pulpcore.client.pulp_python.DistributionsPypiApi(api_client)
     data = pulpcore.client.pulp_python.PythonPythonDistribution(name=name, repository=repository.pulp_href, base_path=base_path)
     try:
-        distro = distro_client.create(data)
+        distro = distro_client.create(data, pulp_domain=configuration.domain)
     except PythonApiException as e:
         if "name" in e.body and "unique" in e.body:
-            distro_list = distro_client.list(name=name)
+            distro_list = distro_client.list(name=name, pulp_domain=configuration.domain)
             distro = distro_list.results.pop()
         else:
             raise e
@@ -116,7 +117,7 @@ def upload_package(configuration, path, labels=None):
     api_client = pulpcore.client.pulp_python.ApiClient(configuration)
     package_client = pulpcore.client.pulp_python.ContentPackagesApi(api_client)
     try:
-        package = package_client.upload(file=path, pulp_labels=labels)
+        package = package_client.upload(file=path, pulp_labels=labels, pulp_domain=configuration.domain)
     except PythonApiException as e:
         print(f"Failed to upload {path}.")
         return None
