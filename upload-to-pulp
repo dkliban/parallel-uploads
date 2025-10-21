@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import tomllib
+from typing import Optional, Generator, Dict
 
 import time
 import pulpcore.client.pulpcore as pulpcore_client
@@ -40,7 +41,7 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-def create_from_config_file(path=None):
+def create_from_config_file(path: Optional[str] = None) -> Configuration:
     """
     Create a Pulp client from a standard configuration file that is
     used by the `pulp` CLI tool
@@ -49,7 +50,6 @@ def create_from_config_file(path=None):
     with open(path, "rb") as fp:
         config = tomllib.load(fp)["cli-prod"]
         configuration = Configuration()
-        #import pdb; pdb.set_trace()
         configuration.host = config["base_url"]
         #configuration.username = config["username"]
         #configuration.password = config["password"]
@@ -61,7 +61,7 @@ def create_from_config_file(path=None):
     return configuration
 
 
-def packages(source_dir):
+def packages(source_dir: str) -> Generator[str, None, None]:
     """
     Generator that yields package names from a source directory.
     """
@@ -71,7 +71,7 @@ def packages(source_dir):
             if filename.endswith(".rpm") or filename.endswith(".srpm"):
                 yield os.path.join(root, filename)
 
-def monitor_task(configuration, task_href):
+def monitor_task(configuration: Configuration, task_href: str):
     """
     Wait for a task to complete.
     """
@@ -89,7 +89,7 @@ def upload_package_in_chunks(
     path: str,
     max_chunk_size: int,
     file_size_bytes: int,
-    labels: dict[str, str],
+    labels: Dict[str, str],
 ) -> pulp_rpm_client.models.RpmPackageResponse:
     """
     Upload a python build artifact in chunks to a Pulp server with the given labels.
@@ -167,7 +167,7 @@ def upload_package_in_chunks(
     return content_details
 
 
-def upload_rpm(client, filepath, labels):
+def upload_rpm(client: pulp_rpm_client.ApiClient, filepath: str, labels: Dict[str, str]) -> Optional[str]:
     """Upload a single RPM and return its PRN."""
     package_client = ContentPackagesApi(client)
     domain = client.configuration.domain
@@ -178,7 +178,7 @@ def upload_rpm(client, filepath, labels):
         return None
     return package.prn
 
-def ensure_repository(client, name):
+def ensure_repository(client: pulp_rpm_client.ApiClient, name: str) -> RpmRpmRepository:
     """Try to create repo, else fetch if already exists."""
     repo_client = RepositoriesRpmApi(client)
     data = RpmRpmRepository(name=name, autopublish=True)
@@ -197,7 +197,7 @@ def ensure_repository(client, name):
             raise e
     return repo
 
-def ensure_distribution(client, name, repo_href, base_path):
+def ensure_distribution(client: pulp_rpm_client.ApiClient, name: str, repo_href: str, base_path: str) -> str:
     """Try to create distribution, else fetch if already exists."""
 
     distro_client = DistributionsRpmApi(client)
@@ -215,21 +215,18 @@ def ensure_distribution(client, name, repo_href, base_path):
             raise e
     return distro
 
-def add_packages_to_repository(client, repository, packages):
+def add_packages_to_repository(client: pulp_rpm_client.ApiClient, repository: RpmRpmRepository, packages: list[str]) -> None:
     """
     Creates a new repository version by adding packages to the repository.
     """
-    import pdb;pdb.set_trace()
     repo_client = RepositoriesRpmApi(client)
     response = repo_client.modify(rpm_rpm_repository_href=repository.pulp_href, repository_add_remove_content={"add_content_units":packages, "remove_content_units":None})
     print(f"Repository Version Create Task: {response.task}")
     task = monitor_task(client.configuration, response.task)
     print(f"Repository Version Task State: {task.state}")
 
-def main():
+def main() -> None:
     import os
-    import pdb;pdb.set_trace(
-    )
     if len(sys.argv) != 5:
         print(f"Usage: {sys.argv[0]} <source_dir> <repo_name> <base_path> <pulp_labels_json>")
         sys.exit(1)
