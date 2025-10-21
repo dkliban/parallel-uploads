@@ -1,292 +1,286 @@
 #!/usr/bin/env python3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import tomllib
-from urllib.parse import urlencode
-import requests
+
+import time
+import pulpcore.client.pulpcore as pulpcore_client
+import pulpcore.client.pulp_rpm as pulp_rpm_client
+
+from pulpcore.client.pulpcore import Configuration, TasksApi, Upload, UploadsApi, UploadCommit
+from pulpcore.client.pulp_rpm import ContentPackagesApi, DistributionsRpmApi, RepositoriesRpmApi, RpmRpmDistribution, RpmRpmRepository
+
+from pulpcore.client.pulpcore.rest import ApiException as PulpcroeApiException
+from pulpcore.client.pulp_rpm.rest import ApiException as RpmApiException
+
+from pprint import pprint
+
+def setup_logging() -> logging.Logger:
+    logFormatter = logging.Formatter("%(asctime)s - %(filename)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    # Add a console handler
+    consoleHandler = logging.StreamHandler()
+    consoleHandler.setFormatter(logFormatter)
+    logger.addHandler(consoleHandler)
+
+    # Add a file handler
+    fileHandler = logging.FileHandler("upload-to-pulp.log")
+    fileHandler.setFormatter(logFormatter)
+    logger.addHandler(fileHandler)
+
+    return logger
 
 
-class PulpClient:
+logger = setup_logging()
+
+def create_from_config_file(path=None):
     """
-    A client for interacting with Pulp API.
+    Create a Pulp client from a standard configuration file that is
+    used by the `pulp` CLI tool
+    """
+    path = os.path.expanduser(path or "~/.config/pulp/cli.toml")
+    with open(path, "rb") as fp:
+        config = tomllib.load(fp)["cli-prod"]
+        configuration = Configuration()
+        #import pdb; pdb.set_trace()
+        configuration.host = config["base_url"]
+        #configuration.username = config["username"]
+        #configuration.password = config["password"]
+        configuration.cert_file = config["cert"]
+        configuration.key_file = config["key"]
+        configuration.domain = config["domain"]
+        configuration.proxy = os.environ.get("HTTPS_PROXY")
 
-    API documentation:
-    - https://docs.pulpproject.org/pulp_rpm/restapi.html
-    - https://docs.pulpproject.org/pulpcore/restapi.html
+    return configuration
 
-    A note regarding PUT vs PATCH:
-    - PUT changes all data and therefore all required fields needs to be sent
-    - PATCH changes only the data that we are sending
 
-    A lot of the methods require repository, distribution, publication, etc,
-    to be the full API endpoint (called "pulp_href"), not simply their name.
-    If method argument doesn't have "name" in its name, assume it expects
-    pulp_href. It looks like this:
-    /pulp/api/v3/publications/rpm/rpm/5e6827db-260f-4a0f-8e22-7f17d6a2b5cc/
+def packages(source_dir):
+    """
+    Generator that yields package names from a source directory.
     """
 
-    @classmethod
-    def create_from_config_file(cls, path=None, log=None, opts=None):
-        """
-        Create a Pulp client from a standard configuration file that is
-        used by the `pulp` CLI tool
-        """
-        path = os.path.expanduser(path or "~/.config/pulp/cli.toml")
-        with open(path, "rb") as fp:
-            config = tomllib.load(fp)
-        return cls(config["cli"], log, opts)
+    for root, _, files in os.walk(source_dir):
+        for filename in files:
+            if filename.endswith(".rpm") or filename.endswith(".srpm"):
+                yield os.path.join(root, filename)
 
-    def __init__(self, config, log=None, opts=None):
-        self.config = config
-        self.timeout = 60
-        self.log = log or logging.getLogger(__name__)
-        self.opts = opts
+def monitor_task(configuration, task_href):
+    """
+    Wait for a task to complete.
+    """
+    pulpcore_api_client = pulpcore_client.ApiClient(configuration)
+    task_client = TasksApi(pulpcore_api_client)
+    print(f"Waiting for task {task_href} to complete...")
+    while True:
+        task = task_client.read(task_href)
+        if task.state in ["completed", "cancelled", "failed"]:
+            return task
+        time.sleep(5)
 
-    @property
-    def auth(self):
-        """
-        https://requests.readthedocs.io/en/latest/user/authentication/
-        """
-        return (self.config["username"], self.config["password"])
+def upload_package_in_chunks(
+    client: pulpcore_client.ApiClient,
+    path: str,
+    max_chunk_size: int,
+    file_size_bytes: int,
+    labels: dict[str, str],
+) -> pulp_rpm_client.models.RpmPackageResponse:
+    """
+    Upload a python build artifact in chunks to a Pulp server with the given labels.
+    """
+    uploads_api = UploadsApi(client)
 
-    @property
-    def cert(self):
-        """
-        See Client Side Certificates
-        https://docs.python-requests.org/en/latest/user/advanced/
-        """
-        return (self.config["cert"], self.config["key"])
+    # we create the upload object and tell pulp the chunked upload is happening
+    upload = Upload(size=file_size_bytes)
+    upload_res = uploads_api.create(upload, pulp_domain=client.configuration.domain)
 
-    def url(self, endpoint):
-        """
-        A fully qualified URL for a given API endpoint
-        """
-        domain = self.config["domain"]
-        if domain == "default":
-            domain = ""
+    logger.info(f"Starting upload of file '{path}' to pulp in chunks...")
+    sha256_chunks = hashlib.sha256()
+    start = 0
 
-        relative = os.path.normpath("/".join([
-            self.config["api_root"],
-            domain,
-            endpoint,
-        ]))
+    with open(path, "rb") as f:
+        while chunk := f.read(max_chunk_size):
+            end = start + len(chunk) - 1
 
-        # Normpath removes the trailing slash. If it was there, put it back
-        if endpoint[-1] == "/":
-            relative += "/"
-        return self.config["base_url"] + relative
+            logger.info(f"Uploading bytes from chunk {start}-{end}.")
+            uploads_api.update(content_range=f"bytes {start}-{end}/*",
+                               upload_href=upload_res.pulp_href,
+                               file=chunk)
+            sha256_chunks.update(chunk)
 
-    @property
-    def request_params(self):
-        """
-        Default parameters for our requests
-        """
-        params = {"timeout": self.timeout}
-        if all(self.cert):
-            params["cert"] = self.cert
+            start = end + 1
+
+    logger.info(f"Committing upload of file '{path}' to pulp in chunks...")
+    # we create a UploadCommit object and tell pulp it can close the upload process
+    upload_commit = UploadCommit(
+        sha256=sha256_chunks.hexdigest()
+    )
+
+    async_task_res = uploads_api.commit(upload_href=upload_res.pulp_href, upload_commit=upload_commit)
+    task_res = monitor_task(client.configuration, async_task_res.task)
+
+    if task_res.error:
+        raise ValueError(f"Error uploading file '{path}' to pulp: {task_res.error}")
+
+    artifact_prn = task_res.created_resources[0]
+
+    logger.info(f"File '{path}' created as an artifact in pulp with PRN: {artifact_prn}")
+    logger.info(f"Converting PULP artifact with PRN '{artifact_prn}' to a python package...")
+    # when an artifact is created in pulp through chunked upload it is not immidiatly
+    # identified as a python package so we need to tell pulp to create a python package from the artifact
+    content_api_client = pulp_rpm_client.ApiClient(client.api.configuration)
+    content_client = ContentPackagesApi(content_api_client)
+    content_task_res = content_client.create(
+        relative_path=str(os.path.basename(path)),
+        artifact=artifact_prn,
+        pulp_domain=client.configuration.domain,
+    )
+
+    task_res = monitor_task(client.configuration, content_task_res.task)
+
+    package_prn = task_res.created_resources[0]
+
+    if task_res.error:
+        raise ValueError(f"Error during adding file '{path}' as a python package in pulp: {task_res.error}")
+
+    content_details = content_client.read(python_python_package_content_href=package_prn)
+
+    logger.info(f"File '{path}' converted to a python package in pulp with PRN: {content_details.prn}")
+
+    # if labels are provided, we need to set them for the python package
+    if labels:
+        logger.info(f"Setting labels for uploaded python package '{path}'...")
+        for key, value in labels.items():
+            content_client.set_label(
+                python_python_package_content_href=content_details.pulp_href,
+                set_label=pulpcore.client.pulp_python.models.SetLabel(key=key, value=value),
+            )
+
+    logger.info(f"Uploading of file '{path}' to pulp in chunks completed.")
+
+    return content_details
+
+
+def upload_rpm(client, filepath, labels):
+    """Upload a single RPM and return its PRN."""
+    package_client = ContentPackagesApi(client)
+    domain = client.configuration.domain
+    try:
+        package = package_client.upload(file=filepath, pulp_labels=labels, pulp_domain=domain)
+    except RpmApiException as e:
+        print(f"Failed to upload {filepath}. {e.body}")
+        return None
+    return package.prn
+
+def ensure_repository(client, name):
+    """Try to create repo, else fetch if already exists."""
+    repo_client = RepositoriesRpmApi(client)
+    data = RpmRpmRepository(name=name, autopublish=True)
+    domain = client.configuration.domain
+    try:
+        repo = repo_client.create(data, pulp_domain=domain)
+    except RpmApiException as e:
+        if "name" in e.body and "unique" in e.body:
+            repo_list = repo_client.list(name=name, pulp_domain=domain)
+            if repo_list.results:
+                repo = repo_list.results.pop()
+            else:
+                # A different type of repository already exists with this name
+                raise e
         else:
-            params["auth"] = self.auth
-        return params
+            raise e
+    return repo
 
-    def create_repository(self, name):
-        """
-        Create an RPM repository
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Repositories:-Rpm/operation/repositories_rpm_rpm_create
-        """
-        uri = "/api/v3/repositories/rpm/rpm/"
-        data = {"name": name, "retain_repo_versions": 1, "retain_package_versions": 5}
-        self.log.info("Pulp: create_repository: %s %s", uri, name)
-        return requests.post(self.url(uri), json=data, **self.request_params)
+def ensure_distribution(client, name, repo_href, base_path):
+    """Try to create distribution, else fetch if already exists."""
 
-    def get_repository(self, name):
-        """
-        Get a single RPM repository
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Repositories:-Rpm/operation/repositories_rpm_rpm_list
-        """
-        # There is no endpoint for querying a single repository by its name,
-        # even Pulp CLI does this workaround
-        uri = "/api/v3/repositories/rpm/rpm/?"
-        uri += urlencode({"name": name, "offset": 0, "limit": 1})
-        self.log.info("Pulp: get_repository: %s", uri)
-        return requests.get(self.url(uri), **self.request_params)
+    distro_client = DistributionsRpmApi(client)
+    data = RpmRpmDistribution(name=name, repository=repo_href, base_path=base_path)
+    domain = client.configuration.domain
+    try:
+        distro_response = distro_client.create(data, pulp_domain=domain)
+        task = monitor_task(client.configuration, distro_response.task)
+        return task.created_resources[0]
+    except RpmApiException as e:
+        if "name" in e.body and "unique" in e.body:
+            distro_list = distro_client.list(name=name, pulp_domain=domain)
+            distro = distro_list.results.pop()
+        else:
+            raise e
+    return distro
 
-    def get_distribution(self, name):
-        """
-        Get a single RPM distribution
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Distributions:-Rpm/operation/distributions_rpm_rpm_list
-        """
-        # There is no endpoint for querying a single repository by its name,
-        # even Pulp CLI does this workaround
-        uri = "/api/v3/distributions/rpm/rpm/?"
-        uri += urlencode({"name": name, "offset": 0, "limit": 1})
-        self.log.info("Pulp: get_distribution: %s", uri)
-        return requests.get(self.url(uri), **self.request_params)
+def add_packages_to_repository(client, repository, packages):
+    """
+    Creates a new repository version by adding packages to the repository.
+    """
+    import pdb;pdb.set_trace()
+    repo_client = RepositoriesRpmApi(client)
+    response = repo_client.modify(rpm_rpm_repository_href=repository.pulp_href, repository_add_remove_content={"add_content_units":packages, "remove_content_units":None})
+    print(f"Repository Version Create Task: {response.task}")
+    task = monitor_task(client.configuration, response.task)
+    print(f"Repository Version Task State: {task.state}")
 
-    def get_task(self, task):
-        """
-        Get a detailed information about a task
-        """
-        return self.get_by_href(task)
+def main():
+    import os
+    import pdb;pdb.set_trace(
+    )
+    if len(sys.argv) != 5:
+        print(f"Usage: {sys.argv[0]} <source_dir> <repo_name> <base_path> <pulp_labels_json>")
+        sys.exit(1)
 
-    def get_by_href(self, href):
-        """
-        Get a detailed information about an object
-        """
-        url = self.config["base_url"] + href
-        self.log.info("Pulp: get_by_href: %s", href)
-        return requests.get(url, **self.request_params)
+    source_dir, repo_name, base_path, labels_arg = sys.argv[1:5]
 
-    def create_distribution(self, name, repository, basepath=None):
-        """
-        Create an RPM distribution
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Distributions:-Rpm/operation/distributions_rpm_rpm_create
-        """
-        uri = "/api/v3/distributions/rpm/rpm/"
-        data = {
-            "name": name,
-            "repository": repository,
-            "base_path": basepath or name,
-        }
-        self.log.info("Pulp: create_distribution: %s %s", uri, data)
-        return requests.post(self.url(uri), json=data, **self.request_params)
+    try:
+        pulp_labels = json.loads(labels_arg)
+        if not isinstance(pulp_labels, dict):
+            raise ValueError("pulp_labels must be a JSON object")
+    except json.JSONDecodeError:
+        print("Error: pulp_labels must be valid JSON (e.g. '{\"env\":\"prod\"}')")
+        sys.exit(1)
 
-    def update_distribution(self, distribution, publication=None, repository=None):
-        """
-        Update an RPM distribution
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Distributions:-Rpm/operation/distributions_rpm_rpm_update
+    if not os.path.isdir(source_dir):
+        print(f"Error: {source_dir} is not a valid directory.")
+        sys.exit(1)
 
-        This allows us to point a distribution to either a publication or
-        a repository. Not both, that doesn't make sense and Pulp would raise
-        "Only one of the attributes 'repository' and 'publication' may be used simultaneously."
-        """
-        if publication and repository:
-            raise RuntimeError("Specify either publication or repository")
+    configuration = create_from_config_file()
+    pulpcore_api_client = pulpcore_client.ApiClient(configuration)
+    pulp_rpm_api_client = pulp_rpm_client.ApiClient(configuration)
 
-        url = self.config["base_url"] + distribution
-        data = {
-            "publication": publication,
-            "repository": repository,
-        }
-        self.log.info("Pulp: updating distribution %s", distribution)
-        return requests.patch(url, json=data, **self.request_params)
 
-    def create_publication(self, repository):
-        """
-        Create an RPM publication
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Publications:-Rpm/operation/publications_rpm_rpm_create
-        """
-        uri = "/api/v3/publications/rpm/rpm/"
-        data = {"repository": repository}
-        self.log.info("Pulp: publishing %s %s", uri, repository)
-        return requests.post(self.url(uri), json=data, **self.request_params)
+    # --- Step 1: Ensure repository ---
+    repo = ensure_repository(pulp_rpm_api_client, repo_name)
 
-    def get_publication(self, repository):
-        """
-        Get a single RPM publication
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Publications:-Rpm/operation/publications_rpm_rpm_list
-        """
-        # There is no endpoint for querying a single publication
-        uri = "/api/v3/publications/rpm/rpm/?"
-        uri += urlencode({"repository": repository, "offset": 0, "limit": 1})
-        self.log.info("Pulp: get_publicatoin: %s", uri)
-        return requests.get(self.url(uri), **self.request_params)
+    # --- Step 2: Ensure distribution ---
+    dist_href = ensure_distribution(pulp_rpm_api_client, repo_name, repo.pulp_href, base_path)
 
-    def create_content(self, path, labels):
-        """
-        Create content for a given artifact
-        https://docs.pulpproject.org/pulp_rpm/restapi.html#tag/Content:-Packages/operation/content_rpm_packages_create
-        """
-        uri = "/api/v3/content/rpm/packages/upload/"
-        with open(path, "rb") as fp:
-            data = {"pulp_labels": json.dumps(labels)}
-            files = {"file": fp}
-            self.log.info("Pulp: create_content: %s %s", uri, path)
-            package = requests.post(
-                self.url(uri), data=data, files=files, **self.request_params)
-        return package
+    # --- Step 4: Upload RPMs in parallel ---
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        prns = []
+        futures = []
+        # Walk source directory
+        for f in packages(source_dir):
+            futures.append(executor.submit(upload_rpm, pulp_rpm_api_client, f, pulp_labels))
 
-    def modify_repository_content(self, repository, add_content_units, remove_content_units):
-        """
-        Add and/or remove a list of artifacts to/from a repository
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Repositories:-Rpm/operation/repositories_rpm_rpm_modify
-        """
-        path = os.path.join(repository, "modify/")
-        url = self.config["base_url"] + path
-        data = {"add_content_units": add_content_units or [], "remove_content_units": remove_content_units or []}
-        return requests.post(url, json=data, **self.request_params)
+        for future in as_completed(futures):
+            prn = future.result()
+            if prn:
+                prns.append(prn)
+                #print(f"Uploaded: {[future]} -> {prn}")
 
-    def get_rpms(self, pulp_labels):
-        """
-        Get a list of PRNs for RPMs with provided labels
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Content:-Packages/operation/content_rpm_packages_list
-        """
-        query = ""
-        for k, v in pulp_labels.items():
-            if query:
-                query += " OR "
-            query += f"pulp_label_select=\"{k}={v}\""
+    print(f"Uploaded {len(prns)} RPMs successfully")
 
-        uri = "api/v3/content/rpm/packages/?"
-        # Setting the limit to 1000, but in the future we should use pagination
-        uri += urlencode({"q": query, "fields": "prn,location_href", "offset": 0, "limit": 1000})
-        self.log.info("Pulp: get_content: %s, query = %s", uri, query)
-        return requests.get(self.url(uri), **self.request_params)
+    # --- Step 5: Add uploaded content to repository ---
+    if prns:
+        print("Adding content to repository...")
+        task = add_packages_to_repository(pulp_rpm_api_client, repo, prns)
 
-    def delete_repository(self, repository):
-        """
-        Delete an RPM repository
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Repositories:-Rpm/operation/repositories_rpm_rpm_delete
-        """
-        url = self.config["base_url"] + repository
-        self.log.info("Pulp: delete_repository: %s", repository)
-        return requests.delete(url, **self.request_params)
+    print("✅ All done!")
 
-    def delete_distribution(self, distribution):
-        """
-        Delete an RPM distribution
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Distributions:-Rpm/operation/distributions_rpm_rpm_delete
-        """
-        url = self.config["base_url"] + distribution
-        self.log.info("Pulp: delete_distribution: %s", distribution)
-        return requests.delete(url, **self.request_params)
-
-    def wait_for_finished_task(self, task, timeout=86400):
-        """
-        Pulp task (e.g. creating a publication) can be running for an
-        unpredictably long time. We need to wait until it is finished to know
-        what it actually did.
-        """
-        start = time.time()
-        while True:
-            self.log.info("Pulp: polling task status: %s", task)
-            response = self.get_task(task)
-            if not response.ok:
-                break
-            if response.json()["state"] not in ["waiting", "running"]:
-                break
-            if time.time() > start + timeout:
-                break
-            time.sleep(5)
-        return response
-
-    def list_distributions(self, prefix):
-        """
-        Get a list of distributions whose names match a given prefix
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Distributions:-Rpm/operation/distributions_rpm_rpm_list
-        """
-        uri = "api/v3/distributions/rpm/rpm/?"
-        uri += urlencode({"name__startswith": prefix})
-        self.log.info("Pulp: list_distributions: %s", uri)
-        return requests.get(self.url(uri), **self.request_params)
-
-    def set_label(self, href, name, value):
-        """
-        Set a label on a given object
-        https://pulpproject.org/pulp_rpm/restapi/#tag/Content:-Packages/operation/content_rpm_packages_set_label
-        """
-        uri = href + "set_label/"
-        data = {"key": name, "value": value}
-        self.log.info("Pulp: set_label: %s", uri)
-        return requests.post(self.url(uri), json=data, **self.request_params)
+if __name__ == "__main__":
+    main()
