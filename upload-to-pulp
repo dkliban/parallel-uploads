@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 import json
 import logging
 import os
@@ -9,17 +8,14 @@ import time
 import tomllib
 from typing import Optional, Generator, Dict
 
-import time
 import pulpcore.client.pulpcore as pulpcore_client
 import pulpcore.client.pulp_rpm as pulp_rpm_client
 
-from pulpcore.client.pulpcore import Configuration, TasksApi, Upload, UploadsApi, UploadCommit
+from pulpcore.client.pulpcore import Configuration, TasksApi
 from pulpcore.client.pulp_rpm import ContentPackagesApi, DistributionsRpmApi, RepositoriesRpmApi, RpmRpmDistribution, RpmRpmRepository
 
-from pulpcore.client.pulpcore.rest import ApiException as PulpcroeApiException
 from pulpcore.client.pulp_rpm.rest import ApiException as RpmApiException
 
-from pprint import pprint
 
 def setup_logging() -> logging.Logger:
     logFormatter = logging.Formatter("%(asctime)s - %(filename)s - %(levelname)s - %(message)s")
@@ -84,99 +80,22 @@ def monitor_task(configuration: Configuration, task_href: str):
             return task
         time.sleep(5)
 
-def upload_package_in_chunks(
-    client: pulpcore_client.ApiClient,
-    path: str,
-    max_chunk_size: int,
-    file_size_bytes: int,
-    labels: Dict[str, str],
-) -> pulp_rpm_client.models.RpmPackageResponse:
-    """
-    Upload a python build artifact in chunks to a Pulp server with the given labels.
-    """
-    uploads_api = UploadsApi(client)
-
-    # we create the upload object and tell pulp the chunked upload is happening
-    upload = Upload(size=file_size_bytes)
-    upload_res = uploads_api.create(upload, pulp_domain=client.configuration.domain)
-
-    logger.info(f"Starting upload of file '{path}' to pulp in chunks...")
-    sha256_chunks = hashlib.sha256()
-    start = 0
-
-    with open(path, "rb") as f:
-        while chunk := f.read(max_chunk_size):
-            end = start + len(chunk) - 1
-
-            logger.info(f"Uploading bytes from chunk {start}-{end}.")
-            uploads_api.update(content_range=f"bytes {start}-{end}/*",
-                               upload_href=upload_res.pulp_href,
-                               file=chunk)
-            sha256_chunks.update(chunk)
-
-            start = end + 1
-
-    logger.info(f"Committing upload of file '{path}' to pulp in chunks...")
-    # we create a UploadCommit object and tell pulp it can close the upload process
-    upload_commit = UploadCommit(
-        sha256=sha256_chunks.hexdigest()
-    )
-
-    async_task_res = uploads_api.commit(upload_href=upload_res.pulp_href, upload_commit=upload_commit)
-    task_res = monitor_task(client.configuration, async_task_res.task)
-
-    if task_res.error:
-        raise ValueError(f"Error uploading file '{path}' to pulp: {task_res.error}")
-
-    artifact_prn = task_res.created_resources[0]
-
-    logger.info(f"File '{path}' created as an artifact in pulp with PRN: {artifact_prn}")
-    logger.info(f"Converting PULP artifact with PRN '{artifact_prn}' to a python package...")
-    # when an artifact is created in pulp through chunked upload it is not immidiatly
-    # identified as a python package so we need to tell pulp to create a python package from the artifact
-    content_api_client = pulp_rpm_client.ApiClient(client.api.configuration)
-    content_client = ContentPackagesApi(content_api_client)
-    content_task_res = content_client.create(
-        relative_path=str(os.path.basename(path)),
-        artifact=artifact_prn,
-        pulp_domain=client.configuration.domain,
-    )
-
-    task_res = monitor_task(client.configuration, content_task_res.task)
-
-    package_prn = task_res.created_resources[0]
-
-    if task_res.error:
-        raise ValueError(f"Error during adding file '{path}' as a python package in pulp: {task_res.error}")
-
-    content_details = content_client.read(python_python_package_content_href=package_prn)
-
-    logger.info(f"File '{path}' converted to a python package in pulp with PRN: {content_details.prn}")
-
-    # if labels are provided, we need to set them for the python package
-    if labels:
-        logger.info(f"Setting labels for uploaded python package '{path}'...")
-        for key, value in labels.items():
-            content_client.set_label(
-                python_python_package_content_href=content_details.pulp_href,
-                set_label=pulpcore.client.pulp_python.models.SetLabel(key=key, value=value),
-            )
-
-    logger.info(f"Uploading of file '{path}' to pulp in chunks completed.")
-
-    return content_details
-
 
 def upload_rpm(client: pulp_rpm_client.ApiClient, filepath: str, labels: Dict[str, str]) -> Optional[str]:
     """Upload a single RPM and return its PRN."""
     package_client = ContentPackagesApi(client)
     domain = client.configuration.domain
+
+    file_size = os.path.getsize(filepath)
+    logger.info(f"Uploading {filepath} ({file_size / (1024*1024):.2f}MB)")
+
     try:
         package = package_client.upload(file=filepath, pulp_labels=labels, pulp_domain=domain)
+        logger.info(f"Successfully uploaded {filepath} with PRN: {package.prn}")
+        return package.prn
     except RpmApiException as e:
-        print(f"Failed to upload {filepath}. {e.body}")
+        logger.error(f"Failed to upload {filepath}: {e.body}")
         return None
-    return package.prn
 
 def ensure_repository(client: pulp_rpm_client.ApiClient, name: str) -> RpmRpmRepository:
     """Try to create repo, else fetch if already exists."""
@@ -215,7 +134,7 @@ def ensure_distribution(client: pulp_rpm_client.ApiClient, name: str, repo_href:
             raise e
     return distro
 
-def add_packages_to_repository(client: pulp_rpm_client.ApiClient, repository: RpmRpmRepository, packages: list[str]) -> None:
+def add_packages_to_repository(client: pulp_rpm_client.ApiClient, repository: RpmRpmRepository, packages: list[str]):
     """
     Creates a new repository version by adding packages to the repository.
     """
@@ -224,6 +143,7 @@ def add_packages_to_repository(client: pulp_rpm_client.ApiClient, repository: Rp
     print(f"Repository Version Create Task: {response.task}")
     task = monitor_task(client.configuration, response.task)
     print(f"Repository Version Task State: {task.state}")
+    return task
 
 def main() -> None:
     import os
@@ -276,6 +196,13 @@ def main() -> None:
     if prns:
         print("Adding content to repository...")
         task = add_packages_to_repository(pulp_rpm_api_client, repo, prns)
+        if task.state == "failed":
+            print(f"❌ Failed to add packages to repository. Task: {task.pulp_href}")
+            print(f"Error: {task.error}")
+            sys.exit(1)
+        elif task.state == "cancelled":
+            print(f"⚠️  Task was cancelled. Task: {task.pulp_href}")
+            sys.exit(1)
 
     print("✅ All done!")
 
